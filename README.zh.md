@@ -74,18 +74,23 @@ AgentRouter 用户在 Harness 里看到的是这行提示，而它是错的：
 
 ## 安装
 
+尚未发布到 npm，直接从仓库安装：
+
 ```bash
-dsh plugin --profile web add dsh-provider-client-identity
+dsh plugin --profile web add github:AlanNiew/dsh-provider-client-identity
 ```
 
-包自带 Cordis bundle，装载行会自动插入并预填 AgentRouter 预设。装完**需要重启 Harness** ——
-插件模块有缓存，仅靠 patch 热重载不会重新导入。
+`dsh plugin` 会在 profile 目录里转发给 pnpm，然后**自行重整 layer 栈**：因为包声明了 `dsh.bundle`，
+它会自动被加进 `dsh.profile.bundles`，其 patch 再插入装载行并预填 AgentRouter 预设。
+装完**需要重启 Harness** —— 插件模块有缓存，仅靠 patch 热重载不会重新导入。
+
+将来发布到 npm 后，`dsh plugin --profile web add dsh-provider-client-identity` 效果完全相同。
 
 <details>
-<summary>手动安装（不用 bundle）</summary>
+<summary>手动安装（不用 bundle、不用 pnpm）</summary>
 
-把包放到任意位置，在 profile 的 `cordis.patch.yml` 里引用入口文件。加载器会把相对路径转成以
-patch 文件为基准的 `file://` URL：
+在 profile 的 `cordis.patch.yml` 里直接引用入口文件。加载器会把相对路径转成以 patch 文件为基准的
+`file://` URL：
 
 ```yaml
 - insert:
@@ -98,9 +103,15 @@ patch 文件为基准的 `file://` URL：
 ```
 </details>
 
+> 两种安装方式**不要混用**。两者用的都是同一个装载行 id `provider-client-identity`，
+> profile 里同时存在手动行和已安装的 bundle 会因 **duplicate loader entry id** 启动失败。
+> 从手动安装迁移时，先删掉手动行再装包。
+
 ## 配置
 
-全部可选，默认值就是 AgentRouter 预设。
+每个字段都可选；**省略**的字段回落到 AgentRouter 预设。显式给出的列表会**原样采用 ——
+包括空列表**，所以 `hosts: []` 表示"不做域名兜底"，而不是悄悄恢复预设。
+要彻底关掉插件，在它的装载行上设 `disabled: true`。
 
 ```yaml
 - id: provider-client-identity
@@ -160,7 +171,7 @@ llm-pi-ai:
 ## 验证
 
 ```bash
-npm test                                              # 14 项离线检查，不联网
+npm test                                              # 18 项离线检查，不联网
 node tools/client-identity-matrix.mjs <key>           # 网关要哪个身份？
 node tools/payload-probe.mjs <key>                    # 它接受哪些请求体形状？
 node tools/gateway-audit.mjs <key>                    # 模型 / 上限 / 模态 / 审核 / 上下文

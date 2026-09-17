@@ -205,7 +205,7 @@ agentrouter.org       → 162.125.80.6（Facebook 的 IP 段！）→ 连接超�
 
 `agentrouter.org` 在国内 DNS 被污染、直连超时 —— 换镜像是合理操作。
 
-**对照实验**（`mirror-probe.mjs`）：两个域名返回**完全相同**的
+**对照实验**（`tools/client-identity-matrix.mjs`）：两个域名返回**完全相同**的
 `unauthorized client detected` 文案、**相同**的 `discord.gg/HgekCyHJqB` 支持链接、
 **相同**的模型列表 → 确认是同一个网关，指纹校验一致。
 
@@ -321,7 +321,7 @@ llm-pi-ai:
 | 症状 | 先跑 | 判读 |
 |---|---|---|
 | 提示「API 密钥无效」 | 解压会话日志搜 `401\|403` | 看到 `unauthorized client detected` → 是 UA/指纹问题，不是密钥 |
-| 同上，且刚换了镜像 | `node mirror-probe.mjs <key>` | 新域名是不是同一个网关；`claude-cli` UA 是否为 200 |
+| 同上，且刚换了镜像 | `node tools/client-identity-matrix.mjs <key>` | 新域名是不是同一个网关；`claude-cli` UA 是否为 200 |
 | `400 unknown variant 'developer'` | 检查 `settings.yaml` | `compat.supportsDeveloperRole` 是否为 `false` |
 | `400 reasoning_content ... must be passed back` | — | 历史来自别的 provider，开新会话 |
 | `402 Budget pool quota` | `node gateway-audit.mjs <key>` | 该模型额度池耗尽，换 `deepseek-v4-flash` |
@@ -334,7 +334,7 @@ llm-pi-ai:
 ```bash
 cd dsh-provider-client-identity
 
-npm test                                  # 插件逻辑 14 项单测，先确认自己没坏
+npm test                                  # 插件逻辑 18 项单测，先确认自己没坏
 node tools/client-identity-matrix.mjs <key>   # 各域名的 UA 对照矩阵
 node tools/gateway-audit.mjs <key>            # 模型可用性 / 上限 / 模态 / 审核 / 长上下文
 node tools/payload-probe.mjs <key>            # 请求体各字段接受度
@@ -380,7 +380,7 @@ node tools/e2e.mjs <key> [baseURL]            # 走真实 openai SDK 的端到�
 dsh-provider-client-identity/
 ├─ index.js                        # 插件本体：作用域化的 fetch 改写
 ├─ cordis.patch.yml                # bundle：插入装载行（预填 AgentRouter 预设）
-├─ test.mjs                        # 14 项单测（含第 3 轮的回归用例）
+├─ test.mjs                        # 18 项单测（含第 3 轮的回归用例）
 ├─ tools/
 │  ├─ e2e.mjs                      # 真实 openai SDK 端到端
 │  ├─ client-identity-matrix.mjs   # 多域名 UA 对照矩阵

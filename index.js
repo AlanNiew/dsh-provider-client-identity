@@ -84,13 +84,23 @@ const DEFAULT_HOSTS = AGENTROUTER_PRESET.hosts
 /** The client identity presented when none is configured. */
 const DEFAULT_USER_AGENT = AGENTROUTER_PRESET.userAgent
 
-function resolveConfig(config = {}) {
-  const providers = Array.isArray(config.providers) && config.providers.length > 0
-    ? config.providers.map((value) => String(value))
-    : [...DEFAULT_PROVIDERS]
-  const hosts = Array.isArray(config.hosts) && config.hosts.length > 0
-    ? config.hosts.map((value) => String(value).toLowerCase())
-    : [...DEFAULT_HOSTS]
+/**
+ * Resolve the effective configuration.
+ *
+ * Only an **omitted** field falls back to the preset. An explicitly supplied
+ * list is honoured as-is, including an empty one — `hosts: []` means "no host
+ * coverage", not "silently reinstate the AgentRouter preset". To turn the whole
+ * plugin off, set `disabled: true` on its loader row instead.
+ *
+ * @param config - the plugin's `config` block.
+ * @returns the resolved route keys, hosts, and client identity.
+ */
+export function resolveConfig(config = {}) {
+  const asList = (value, fallback) => Array.isArray(value)
+    ? value.map((entry) => String(entry))
+    : [...fallback]
+  const providers = asList(config.providers, DEFAULT_PROVIDERS)
+  const hosts = asList(config.hosts, DEFAULT_HOSTS).map((host) => host.toLowerCase())
   const userAgent = typeof config.userAgent === 'string' && config.userAgent.length > 0
     ? config.userAgent
     : DEFAULT_USER_AGENT

@@ -1,7 +1,7 @@
 // Focused tests for the client-identity patch. No network, no Harness needed.
 import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { AGENTROUTER_PRESET, apply, inject, name, patchFetch } from './index.js'
+import { AGENTROUTER_PRESET, apply, inject, name, patchFetch, resolveConfig } from './index.js'
 
 const UA = AGENTROUTER_PRESET.userAgent
 let passed = 0
@@ -139,6 +139,33 @@ check('a configured hosts list replaces the defaults', async () => {
   await patched('https://agentrouter.org/v1/models')
   assert.equal(calls[0].headers.get('user-agent'), UA, 'configured host is rewritten')
   assert.equal(calls[1].headers.get('user-agent'), null, 'dropped default host is not')
+})
+
+check('omitted config falls back to the AgentRouter preset', () => {
+  const resolved = resolveConfig({})
+  assert.ok(resolved.providers.has('agentrouter'))
+  assert.ok(resolved.hosts.has('agentrouter.org'))
+  assert.equal(resolved.userAgent, AGENTROUTER_PRESET.userAgent)
+})
+
+check('an explicit empty list means none, not the preset', () => {
+  // Regression guard for a generic-plugin surprise: `hosts: []` used to
+  // silently reinstate the AgentRouter preset.
+  const resolved = resolveConfig({ providers: [], hosts: [] })
+  assert.equal(resolved.providers.size, 0, 'no route scope requested')
+  assert.equal(resolved.hosts.size, 0, 'no host scope requested')
+  assert.equal(resolved.userAgent, AGENTROUTER_PRESET.userAgent, 'identity still defaults')
+})
+
+check('hosts are lower-cased so matching is case-insensitive', () => {
+  const resolved = resolveConfig({ hosts: ['Mirror.Example'] })
+  assert.ok(resolved.hosts.has('mirror.example'))
+})
+
+check('a non-list value falls back rather than throwing', () => {
+  const resolved = resolveConfig({ providers: 'agentrouter', hosts: 42 })
+  assert.ok(resolved.providers.has('agentrouter'))
+  assert.ok(resolved.hosts.has('agentrouter.org'))
 })
 
 console.log(`\n${passed} checks passed`)

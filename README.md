@@ -82,19 +82,24 @@ plugin uses to add `x-opencode-session`.
 
 ## Install
 
+Not on npm yet, so install straight from the repository:
+
 ```bash
-dsh plugin --profile web add dsh-provider-client-identity
+dsh plugin --profile web add github:AlanNiew/dsh-provider-client-identity
 ```
 
-The package ships a Cordis bundle, so the loader row is inserted for you with the AgentRouter preset
-already filled in. Restart the Harness afterwards — plugin modules are cached, so a live patch reload
-is not enough.
+`dsh plugin` forwards to pnpm in the profile directory and then reconciles the layer stack itself:
+because the package declares `dsh.bundle`, it is added to `dsh.profile.bundles` for you, and its
+patch inserts the loader row with the AgentRouter preset already filled in. **Restart the Harness
+afterwards** — plugin modules are cached, so a live patch reload does not re-import them.
+
+Once published, `dsh plugin --profile web add dsh-provider-client-identity` will work identically.
 
 <details>
-<summary>Manual install (no bundle)</summary>
+<summary>Manual install (no bundle, no pnpm)</summary>
 
-Put the package anywhere and reference the entry file from your profile's `cordis.patch.yml`. The
-loader turns a relative path into a `file://` URL anchored at the patch file:
+Reference the entry file straight from your profile's `cordis.patch.yml`. The loader turns a relative
+path into a `file://` URL anchored at the patch file:
 
 ```yaml
 - insert:
@@ -105,11 +110,17 @@ loader turns a relative path into a `file://` URL anchored at the patch file:
         hosts: [agentrouter.org, ps.air-outer.com]
         userAgent: claude-cli/2.1.251 (external, cli)
 ```
+
+> Do not combine the two. Both routes use the loader id `provider-client-identity`, and a profile
+> carrying both a manual row and the installed bundle fails to boot on a duplicate entry id. If you
+> are migrating from a manual row, delete it before installing the package.
 </details>
 
 ## Configure
 
-Everything is optional; the defaults are the AgentRouter preset.
+Every field is optional; an omitted field falls back to the AgentRouter preset. An explicit list is
+honoured as-is — **including an empty one**, so `hosts: []` means "no host coverage" rather than
+silently reinstating the preset. To turn the plugin off entirely, set `disabled: true` on its row.
 
 ```yaml
 - id: provider-client-identity
@@ -172,7 +183,7 @@ Full profile, plus every other request-shape finding, is in
 ## Verifying
 
 ```bash
-npm test                                              # 14 offline checks, no network
+npm test                                              # 18 offline checks, no network
 node tools/client-identity-matrix.mjs <key>           # which identity does the gateway want?
 node tools/payload-probe.mjs <key>                    # which request shapes does it accept?
 node tools/gateway-audit.mjs <key>                    # models, caps, modalities, moderation, context
