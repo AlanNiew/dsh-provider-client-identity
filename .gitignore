@@ -1,0 +1,11 @@
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Local scratch: probe scripts take the key on argv, never from a file.
+*.local.*
+.env
+.env.*

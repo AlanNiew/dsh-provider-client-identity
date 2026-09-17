@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the declared floor in package.json engines.
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      # No dependencies: the plugin imports only node:async_hooks, and the tests
+      # run offline. Nothing to install, so nothing to cache.
+      - run: npm test

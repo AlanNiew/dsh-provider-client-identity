@@ -1,0 +1,54 @@
+{
+  "name": "dsh-provider-client-identity",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness plugin: present the client identity a provider gateway expects. Fixes the misleading 'API key is invalid' error gateways return when they fingerprint the client User-Agent before checking the key (AgentRouter included).",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "docs",
+    "tools",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test.mjs",
+    "test:e2e": "node tools/e2e.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "cordis",
+    "agentrouter",
+    "user-agent",
+    "unauthorized-client",
+    "client-fingerprint",
+    "api-key-invalid",
+    "llm"
+  ],
+  "license": "MIT",
+  "author": "AlanNiew",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlanNiew/dsh-provider-client-identity.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AlanNiew/dsh-provider-client-identity/issues"
+  },
+  "homepage": "https://github.com/AlanNiew/dsh-provider-client-identity#readme",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

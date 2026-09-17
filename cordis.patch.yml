@@ -1,0 +1,22 @@
+# The bundle this package contributes to a DSH profile.
+#
+# Installing the package (`dsh plugin --profile <name> add dsh-provider-client-identity`)
+# adds it to `dsh.profile.bundles`, and this patch inserts the loader row.
+#
+# The shipped row wires the AgentRouter preset. It is inert on a profile that
+# does not route to AgentRouter: the `llm/stream` scope only matches the route
+# keys named here, and the host list only matches those domains.
+#
+# Using a different gateway? Keep the row and change the config — `providers`
+# to your route key, `hosts` to its domain(s), `userAgent` to the identity it
+# wants. See README.md.
+- insert:
+    - id: provider-client-identity
+      name: dsh-provider-client-identity
+      config:
+        providers:
+          - agentrouter
+        hosts:
+          - agentrouter.org
+          - ps.air-outer.com
+        userAgent: claude-cli/2.1.251 (external, cli)
