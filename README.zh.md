@@ -86,6 +86,11 @@ dsh plugin --profile web add github:AlanNiew/dsh-provider-client-identity
 
 将来发布到 npm 后，`dsh plugin --profile web add dsh-provider-client-identity` 效果完全相同。
 
+卸载：`dsh plugin --profile web remove dsh-provider-client-identity`。
+
+**环境要求。** Node 20+，以及带这两个接缝的 `@deepseek-ai/dsh`：`llm/stream` 瀑布事件和
+fiber 作用域的 `ctx.effect`。开发与验证基于 `0.1.5-rc.2`。插件本身零依赖、无构建步骤。
+
 <details>
 <summary>手动安装（不用 bundle、不用 pnpm）</summary>
 

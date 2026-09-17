@@ -95,6 +95,12 @@ afterwards** — plugin modules are cached, so a live patch reload does not re-i
 
 Once published, `dsh plugin --profile web add dsh-provider-client-identity` will work identically.
 
+To remove it again: `dsh plugin --profile web remove dsh-provider-client-identity`.
+
+**Requirements.** Node 20+, and a `@deepseek-ai/dsh` with the two seams this relies on: the
+`llm/stream` waterfall and fiber-scoped `ctx.effect`. Developed and verified against `0.1.5-rc.2`.
+The package itself has no dependencies and no build step.
+
 <details>
 <summary>Manual install (no bundle, no pnpm)</summary>
 
