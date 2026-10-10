@@ -191,6 +191,8 @@ node tools/e2e.mjs <key>                              # 走真实 OpenAI 客户�
 | --- | --- | --- |
 | 「API 密钥无效」/ `AUTH` | 任何 401/403，包括客户端指纹被拒 | 先解出会话日志里的原始失败，再动密钥 —— 见下 |
 | `401 unauthorized client detected` | `User-Agent` 不被接受 | 跑 `tools/client-identity-matrix.mjs`，改 `userAgent` |
+| `hosts` 里明明有该域名，路由仍 401 | `providers` 里的路由名和 `llm-pi-ai.providers` 的字典键不一致 —— 比如路由叫 `agent-router`，而预设写的是 `agentrouter`。路由作用域是主要依据，于是它永远不命中，只剩主机兜底 | `providers` 必须和**真实字典键**一字不差 |
+| 切到桌面端后「配置丢失」 | 桌面端跑的是**另一个 profile**（`~/.dsh/profiles/desktop`），与网页/CLI 用的 `profiles/web` 相互独立；且 `dsh --profile desktop --dump-config` 会被拒：*"managed exclusively by the Electron application"* | 在 `profiles/desktop/cordis.patch.yml` 里重新应用 provider 配置与插件那一行，然后重启应用 |
 | 改了 `baseURL` 后立刻失效 | 用的是本插件早期版本，其域名检查覆盖了路由作用域 | 升级；现在路由作用域是主要依据（`test.mjs` 已锁死） |
 | `400 unknown variant 'developer'` | 缺 `compat.supportsDeveloperRole: false` | 见上 |
 | `400 reasoning_content ... must be passed back` | 思考模式下回放了没有 reasoning 的 assistant 轮次（典型是历史来自**别的** provider） | 开新会话 |

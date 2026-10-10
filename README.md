@@ -205,6 +205,8 @@ work against any gateway.
 | --- | --- | --- |
 | "API key is invalid" / `AUTH` | Any 401/403, including a client-fingerprint rejection | Decode the raw failure from the session log before touching the key — see below |
 | `401 unauthorized client detected` | `User-Agent` not accepted | `tools/client-identity-matrix.mjs`; fix `userAgent` |
+| `401` on the route even though `hosts` lists its domain | The route key in `providers` does not match the `llm-pi-ai.providers` dict key — e.g. the route is `agent-router` while the preset says `agentrouter`. The route scope is authoritative, so it silently never fires and only the host fallback remains | Match `providers` to the **actual dict key**, character for character |
+| Config "lost" after moving to the desktop app | The desktop app runs a **separate profile** (`~/.dsh/profiles/desktop`) from the web/CLI one (`~/.dsh/profiles/web`); `dsh --profile desktop --dump-config` is refused with *"managed exclusively by the Electron application"* | Re-apply the provider config and the plugin row under `profiles/desktop/cordis.patch.yml`, then restart the app |
 | Still failing right after changing `baseURL` | Following an earlier revision of this plugin, whose host check overrode the route scope | Upgrade; the route scope is authoritative now (`test.mjs` pins it) |
 | `400 unknown variant 'developer'` | Missing `compat.supportsDeveloperRole: false` | See above |
 | `400 reasoning_content ... must be passed back` | Thinking-mode replay of an assistant turn that has no reasoning (typically history produced by a *different* provider) | Start a fresh session |
