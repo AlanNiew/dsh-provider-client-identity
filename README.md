@@ -153,18 +153,35 @@ silently reinstating the preset. To turn the plugin off entirely, set `disabled:
 Note that repointing a route's `baseURL` needs **no** change here — the route scope is authoritative,
 so a mirror works automatically. Only `hosts` (and thus model discovery) is domain-specific.
 
-## The AgentRouter preset also needs one config change
+## The AgentRouter preset also needs two config changes
 
 The client identity is only the first gate. AgentRouter forwards `deepseek-*` to DeepSeek's native
-backend, which is OpenAI-compatible but narrower: it does not know OpenAI's `developer` role. pi-ai
-sends `developer` for a reasoning model, so the request dies with
+backend, which is OpenAI-compatible but narrower. Two `compat` flags are mandatory.
+
+**1. It does not know OpenAI's `developer` role.** pi-ai sends `developer` for a reasoning model, so
+the request dies with
 
 ```
 400: messages[0].role: unknown variant `developer`, expected one of
      `system`, `user`, `assistant`, `tool`, `latest_reminder`
 ```
 
-Fix it in the provider profile:
+**2. It often omits `finish_reason` on the final streamed chunk.** pi-ai requires that marker unless
+`supportsFinishReason` is `false`, and the default is `true`:
+
+```js
+if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "pending") {
+    throw new Error("Stream ended without finish_reason");
+}
+```
+
+The Harness reports that as `upstream stream ended before a completion event; this turn may be
+incomplete`, code `TRANSPORT`, and retries the turn up to five times. Measured against the desktop
+app, about half of all streams omitted the field, and a single turn burned **32** retries. The
+streams are not truncated — the content arrives complete, only the terminal marker is missing, which
+is why every hand-written probe "passed" while the app kept retrying.
+
+Fix both in the provider profile:
 
 ```yaml
 llm-pi-ai:
@@ -173,7 +190,15 @@ llm-pi-ai:
       baseURL: https://ps.air-outer.com/v1   # or https://agentrouter.org/v1
       compat:
         supportsDeveloperRole: false         # keep `system`
+        supportsFinishReason: false          # derive the stop reason from the content
 ```
+
+With `supportsFinishReason: false` pi-ai derives the reason itself — `toolUse` when a tool call was
+emitted, otherwise `stop` — which is what a gateway that skips the marker intends.
+
+Both flags must sit **inside** `compat:`, and `compat:` inside the provider entry. The loader reads
+config by key and silently drops anything one level too high, so a misplaced key looks exactly like a
+gateway that ignores it.
 
 Full profile, plus every other request-shape finding, is in
 [docs/agentrouter.md](./docs/agentrouter.md).
@@ -190,7 +215,7 @@ Full profile, plus every other request-shape finding, is in
 ## Verifying
 
 ```bash
-npm test                                              # 18 offline checks, no network
+npm test                                              # 27 offline checks, no network
 node tools/client-identity-matrix.mjs <key>           # which identity does the gateway want?
 node tools/payload-probe.mjs <key>                    # which request shapes does it accept?
 node tools/gateway-audit.mjs <key>                    # models, caps, modalities, moderation, context
@@ -211,6 +236,8 @@ work against any gateway.
 | Still failing right after changing `baseURL` | Following an earlier revision of this plugin, whose host check overrode the route scope | Upgrade; the route scope is authoritative now (`test.mjs` pins it) |
 | `400 unknown variant 'developer'` | Missing `compat.supportsDeveloperRole: false` | See above |
 | `400 Invalid schema for function '...': null is not of type "array"` | The backend's tool validator rejects OpenAI's `strict` key (as `null`, `false` *or* `true`) **and** an absent `parameters.required`, which it deserialises to `null`. Several backend replicas answer and disagree, so the same request succeeds only some of the time | Set `normalizeTools: true` on the route's row — the AgentRouter preset already does |
+| `TRANSPORT` over and over, "upstream stream ended before a completion event" | Missing `compat.supportsFinishReason: false`. The gateway drops `finish_reason` on roughly half of its streams; pi-ai throws whenever a stream ends without it, and the Harness retries the whole turn each time | Add the flag — see above. Direct probes do **not** reproduce it: they read the content, which is intact |
+| A config key appears to have no effect | The loader reads config by key and drops anything outside its parent silently — e.g. `normalizeTools` written at the loader-row level instead of under `config:` | Check the nesting; `npm test` pins the shipped bundle's layout |
 | `400 reasoning_content ... must be passed back` | Thinking-mode replay of an assistant turn that has no reasoning (typically history produced by a *different* provider) | Start a fresh session |
 | Plugin seems inert | Plugin modules are cached; a patch reload does not re-import them | Restart the Harness |
 

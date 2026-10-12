@@ -21,6 +21,7 @@ llm-pi-ai:
       baseURL: https://ps.air-outer.com/v1     # or https://agentrouter.org/v1
       compat:
         supportsDeveloperRole: false           # required — see below
+        supportsFinishReason: false            # required — see below
       models:
         - id: deepseek-v4-flash
           name: deepseek-v4-flash
@@ -65,6 +66,45 @@ DNS poisoned        -> connect timeout (agentrouter.org from mainland China)
             └─ budget   -> 402 Budget pool quota exhausted
                  └─ moderation -> 400 content-blocked
 ```
+
+---
+
+## Failure 4: not an auth error at all — a retry storm
+
+Distinct from the three above, and it never says "API key is invalid". The gateway omits
+`finish_reason` on a large fraction of its streamed responses, and pi-ai refuses any stream that ends
+without it. From the bundled pi-ai, `openai-completions.js`:
+
+```js
+if (!hasFinishReason && !compat.supportsFinishReason) {
+    output.stopReason = output.content.some((block) => block.type === "toolCall") ? "toolUse" : "stop";
+}
+...
+if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "pending") {
+    throw new Error("Stream ended without finish_reason");
+}
+```
+
+`supportsFinishReason` defaults to `true`, so the throw wins and the Harness reports
+
+```
+upstream stream ended before a completion event; this turn may be incomplete   (code: TRANSPORT)
+```
+
+then retries the turn under
+`["normal", 5, ["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"], 500, 10000, 0.1]` —
+five attempts, 500 ms → 10 s backoff, 10% jitter.
+
+Measured on the desktop app before the fix: **32 retries in one turn**, all `TRANSPORT`, spread
+evenly across 20 minutes — not a bad time window — and not one 401, 400 or 429 among them. That last
+detail is the tell: authentication and request-shape were already clean, so the residual failure had
+to be in how a good response is *read*.
+
+Why every hand-written probe missed it: a probe reads the content, which arrives complete. Only a
+client that requires the terminal marker — i.e. pi-ai — sees a problem. The streams are not truncated.
+
+Fix: set `supportsFinishReason: false`. pi-ai then derives the reason itself, taking exactly the
+branch shown above, which is what a gateway that skips the marker intends.
 
 ---
 

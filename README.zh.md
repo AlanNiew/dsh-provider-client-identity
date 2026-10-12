@@ -142,17 +142,33 @@ fiber 作用域的 `ctx.effect`。开发与验证基于 `0.1.5-rc.2`。插件本
 注意：**换路由的 `baseURL` 不需要改这里** —— 路由作用域是主要依据，所以换镜像自动生效。
 只有 `hosts`（也就是模型发现）跟域名相关。
 
-## AgentRouter 预设还需要改一处配置
+## AgentRouter 预设还需要改两处配置
 
 客户端身份只是第一道门。AgentRouter 把 `deepseek-*` 转发到 DeepSeek 原生后端，它虽然 OpenAI
-兼容但更窄：不认识 OpenAI 的 `developer` 角色。pi-ai 对推理模型会发 `developer`，于是请求死在：
+兼容但更窄。有两个 `compat` 开关是硬性的。
+
+**一、不认识 OpenAI 的 `developer` 角色。** pi-ai 对推理模型会发 `developer`，于是请求死在：
 
 ```
 400: messages[0].role: unknown variant `developer`, expected one of
      `system`, `user`, `assistant`, `tool`, `latest_reminder`
 ```
 
-在 provider 配置里修掉：
+**二、流式响应的最后一个 chunk 经常不带 `finish_reason`。** 除非 `supportsFinishReason` 为
+`false`，pi-ai 就要求这个终止标记，而它的默认值是 `true`：
+
+```js
+if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "pending") {
+    throw new Error("Stream ended without finish_reason");
+}
+```
+
+Harness 把它报成 `upstream stream ended before a completion event; this turn may be incomplete`，
+归类 `TRANSPORT`，并把整个回合重试最多 5 次。桌面端实测：约一半的流缺这个字段，单个回合烧掉
+**32** 次重试。流本身没有被截断 —— 内容完整，只是缺终止标记。这也解释了为什么手写探测全都
+「通过」，而应用一直在重试。
+
+两处都在 provider 配置里修：
 
 ```yaml
 llm-pi-ai:
@@ -161,7 +177,14 @@ llm-pi-ai:
       baseURL: https://ps.air-outer.com/v1   # 或 https://agentrouter.org/v1
       compat:
         supportsDeveloperRole: false         # 保持 system
+        supportsFinishReason: false          # 由内容自行推导终止原因
 ```
+
+设 `supportsFinishReason: false` 后 pi-ai 自己推导：有工具调用就是 `toolUse`，否则 `stop` ——
+这正是跳过该标记的网关的本意。
+
+两个开关都必须写在 `compat:` **里面**，而 `compat:` 要写在 provider 条目里面。加载器按 key 取
+配置，位置高一级的键会被静默丢弃，症状和「网关不认这个键」一模一样。
 
 完整配置、以及其余请求体字段的实测结论，见 [docs/agentrouter.zh.md](./docs/agentrouter.zh.md)。
 
@@ -177,7 +200,7 @@ llm-pi-ai:
 ## 验证
 
 ```bash
-npm test                                              # 18 项离线检查，不联网
+npm test                                              # 27 项离线检查，不联网
 node tools/client-identity-matrix.mjs <key>           # 网关要哪个身份？
 node tools/payload-probe.mjs <key>                    # 它接受哪些请求体形状？
 node tools/gateway-audit.mjs <key>                    # 模型 / 上限 / 模态 / 审核 / 上下文
@@ -198,6 +221,8 @@ node tools/e2e.mjs <key>                              # 走真实 OpenAI 客户�
 | `400 unknown variant 'developer'` | 缺 `compat.supportsDeveloperRole: false` | 见上 |
 | `400 Invalid schema for function '...': null is not of type "array"` | 后端工具校验器既拒绝 OpenAI 的 `strict` 键（`null`/`false`/`true` 全拒），也拒绝缺失的 `parameters.required`（被反序列化成 `null`）。网关后端有多个副本且校验不一致，所以同一请求时好时坏 | 在该路由的行上设 `normalizeTools: true` —— AgentRouter 预设已默认开启 |
 | `400 reasoning_content ... must be passed back` | 思考模式下回放了没有 reasoning 的 assistant 轮次（典型是历史来自**别的** provider） | 开新会话 |
+| `TRANSPORT` 反复出现，`upstream stream ended before a completion event` | 缺 `compat.supportsFinishReason: false`。网关约一半的流不带 `finish_reason`，pi-ai 遇到没有它的流就抛错，Harness 于是整回合重试 | 加上该开关 —— 见上。直连探测**复现不出来**：它只读内容，而内容本身是完整的 |
+| 某个配置键看起来完全没生效 | 加载器按 key 取配置，位置不对的键会被静默丢弃 —— 例如把 `normalizeTools` 写在加载器行一级，而不是 `config:` 下面 | 检查层级；`npm test` 已锁死随包发布的 bundle 结构 |
 | 插件看起来没生效 | 插件模块有缓存，patch 热重载不会重新导入 | 重启 Harness |
 
 **解出原始失败。** UI 只显示归类后的类型。真相在会话日志里，而它是**多帧 zstd** ——

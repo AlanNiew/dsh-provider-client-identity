@@ -1,6 +1,7 @@
 // Focused tests for the client-identity patch. No network, no Harness needed.
 import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { readFileSync } from 'node:fs'
 import { AGENTROUTER_PRESET, apply, inject, name, normalizeToolSchemas, patchFetch, resolveConfig } from './index.js'
 
 const UA = AGENTROUTER_PRESET.userAgent
@@ -256,6 +257,38 @@ check('the fetch patch normalises only targeted requests', () => {
   assert.equal(calls[0].init.body, body, 'untargeted request untouched')
 
   globalThis.fetch = original
+})
+
+// The loader reads a row's `config` by key, so a config key that sits at the
+// row level (or a `config` that is absent) is dropped without any warning.
+// That silently disabled normalizeTools for every profile that installed the
+// package before this was noticed.
+check('the shipped bundle nests normalizeTools inside the loader row config', () => {
+  const lines = readFileSync(new URL('./cordis.patch.yml', import.meta.url), 'utf8').split(/\r?\n/)
+  const indentOf = (key) => {
+    const line = lines.find((l) => new RegExp(`^\\s*${key}:`).test(l))
+    assert.ok(line, `expected a "${key}:" line in cordis.patch.yml`)
+    return line.match(/^\s*/)[0].length
+  }
+  assert.ok(
+    lines.some((l) => /^\s*- insert:\s*$/.test(l)),
+    'the bundle still inserts a loader row',
+  )
+  assert.ok(
+    lines.some((l) => /^\s*- id: provider-client-identity\s*$/.test(l)),
+    'the inserted row keeps its id',
+  )
+  const configIndent = indentOf('config')
+  const normalizeIndent = indentOf('normalizeTools')
+  assert.ok(
+    normalizeIndent > configIndent,
+    `normalizeTools must nest under config: (got ${normalizeIndent}, config at ${configIndent})`,
+  )
+  assert.equal(
+    normalizeIndent,
+    indentOf('userAgent'),
+    'normalizeTools must sit beside the other config keys, not deeper or shallower',
+  )
 })
 
 console.log(`\n${passed} checks passed`)

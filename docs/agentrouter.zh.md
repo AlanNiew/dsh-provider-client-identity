@@ -238,9 +238,9 @@ const targeted = als.getStore() !== undefined
 
 ---
 
-## 3. 三个根因的共性
+## 3. 前三个根因的共性
 
-三次都不是「密钥问题」，但三次都显示同一句话。区别只在**在哪一层被拒**：
+前三次都不是「密钥问题」，但三次都显示同一句话。区别只在**在哪一层被拒**：
 
 ```
 DNS 污染        → 连接超时（agentrouter.org 在国内）
@@ -251,6 +251,9 @@ DNS 污染        → 连接超时（agentrouter.org 在国内）
 ```
 
 排查时按这个顺序自下而上定位，不要跳步。
+
+第 4 个根因（流缺 `finish_reason`，见 5.3）**不属于这一族**：它没有任何一层被拒，响应被完整收下，
+故障出在客户端对终止标记的要求上。它的症状也不同 —— 不是报错文案，而是重试风暴。
 
 ---
 
@@ -302,6 +305,7 @@ llm-pi-ai:
       baseURL: https://ps.air-outer.com/v1     # 国内镜像；直连可用时换回 agentrouter.org
       compat:
         supportsDeveloperRole: false            # 上游只认 system
+        supportsFinishReason: false             # 上游常不带 finish_reason
       models:
         - id: deepseek-v4-flash
           name: deepseek-v4-flash
@@ -311,6 +315,42 @@ llm-pi-ai:
           reasoningEfforts: { low: low, high: high, max: max }
       transport: auto
 ```
+
+### 5.3 还要关掉 `supportsFinishReason`
+
+这一条跟前三条不同：它**从不**报「API 密钥无效」，而是表现为重试风暴。
+
+网关相当大比例的流式响应不带 `finish_reason`，而 pi-ai 拒绝任何没有它的流。摘自随包的
+pi-ai，`openai-completions.js`：
+
+```js
+if (!hasFinishReason && !compat.supportsFinishReason) {
+    output.stopReason = output.content.some((block) => block.type === "toolCall") ? "toolUse" : "stop";
+}
+...
+if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "pending") {
+    throw new Error("Stream ended without finish_reason");
+}
+```
+
+`supportsFinishReason` 默认是 `true`，于是走的是抛错那条路，Harness 报：
+
+```
+upstream stream ended before a completion event; this turn may be incomplete   (code: TRANSPORT)
+```
+
+并按 `["normal", 5, ["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"], 500, 10000, 0.1]`
+重试整个回合 —— 最多 5 次，退避 500 ms → 10 s，10% 抖动。
+
+修复前在桌面端实测：**单个回合 32 次重试**，全是 `TRANSPORT`，均匀铺满 20 分钟（不是坏时间窗），
+而且其中没有一次 401、400 或 429。最后这点是关键线索：认证和请求体形状都已经干净了，剩下的故障
+只能出在「如何读一个正常的响应」上。
+
+**为什么所有手写探测都没发现**：探测只读内容，而内容是完整的。只有要求终止标记的客户端 —— 也就
+是 pi-ai —— 才会看到问题。流并没有被截断。
+
+修复就是设 `supportsFinishReason: false`，pi-ai 于是自己推导终止原因（即上面那段分支），这正是
+跳过该标记的网关的本意。
 
 ---
 
@@ -323,6 +363,7 @@ llm-pi-ai:
 | 提示「API 密钥无效」 | 解压会话日志搜 `401\|403` | 看到 `unauthorized client detected` → 是 UA/指纹问题，不是密钥 |
 | 同上，且刚换了镜像 | `node tools/client-identity-matrix.mjs <key>` | 新域名是不是同一个网关；`claude-cli` UA 是否为 200 |
 | `400 unknown variant 'developer'` | 检查 `settings.yaml` | `compat.supportsDeveloperRole` 是否为 `false` |
+| 反复 `TRANSPORT` 重试，日志里 `upstream stream ended before a completion event` | 解压会话日志数 `llm/retry` 记录 | 缺 `compat.supportsFinishReason: false`。直连探测**测不出来**（内容本身完整），只能看流里 `finish_reason` 是否缺失 —— 见 5.3 |
 | `400 reasoning_content ... must be passed back` | — | 历史来自别的 provider，开新会话 |
 | `402 Budget pool quota` | `node gateway-audit.mjs <key>` | 该模型额度池耗尽，换 `deepseek-v4-flash` |
 | `400 content-blocked` | — | 高度重复的内容触发审核，换成正常文本 |
@@ -334,7 +375,7 @@ llm-pi-ai:
 ```bash
 cd dsh-provider-client-identity
 
-npm test                                  # 插件逻辑 18 项单测，先确认自己没坏
+npm test                                  # 插件逻辑 27 项单测，先确认自己没坏
 node tools/client-identity-matrix.mjs <key>   # 各域名的 UA 对照矩阵
 node tools/gateway-audit.mjs <key>            # 模型可用性 / 上限 / 模态 / 审核 / 长上下文
 node tools/payload-probe.mjs <key>            # 请求体各字段接受度
@@ -380,7 +421,7 @@ node tools/e2e.mjs <key> [baseURL]            # 走真实 openai SDK 的端到�
 dsh-provider-client-identity/
 ├─ index.js                        # 插件本体：作用域化的 fetch 改写
 ├─ cordis.patch.yml                # bundle：插入装载行（预填 AgentRouter 预设）
-├─ test.mjs                        # 18 项单测（含第 3 轮的回归用例）
+├─ test.mjs                        # 27 项单测（含第 3、4 轮的回归用例）
 ├─ tools/
 │  ├─ e2e.mjs                      # 真实 openai SDK 端到端
 │  ├─ client-identity-matrix.mjs   # 多域名 UA 对照矩阵
