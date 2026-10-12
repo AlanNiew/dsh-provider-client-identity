@@ -20,3 +20,4 @@
           - agentrouter.org
           - ps.air-outer.com
         userAgent: claude-cli/2.1.251 (external, cli)
+      normalizeTools: true

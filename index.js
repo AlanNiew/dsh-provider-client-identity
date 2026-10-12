@@ -75,6 +75,7 @@ export const AGENTROUTER_PRESET = Object.freeze({
   providers: Object.freeze(['agentrouter']),
   hosts: Object.freeze(['agentrouter.org', 'ps.air-outer.com']),
   userAgent: 'claude-cli/2.1.251 (external, cli)',
+  normalizeTools: true,
 })
 
 /** Provider routes the override is scoped to when none is configured. */
@@ -104,7 +105,10 @@ export function resolveConfig(config = {}) {
   const userAgent = typeof config.userAgent === 'string' && config.userAgent.length > 0
     ? config.userAgent
     : DEFAULT_USER_AGENT
-  return { providers: new Set(providers), hosts: new Set(hosts), userAgent }
+  const normalizeTools = config.normalizeTools === undefined
+    ? AGENTROUTER_PRESET.normalizeTools
+    : Boolean(config.normalizeTools)
+  return { providers: new Set(providers), hosts: new Set(hosts), userAgent, normalizeTools }
 }
 
 /** Read the request URL from whatever `fetch` was handed. */
@@ -162,6 +166,71 @@ export function withStore(iterable, als) {
 }
 
 /**
+ * Normalise the tool schemas in a JSON request body for a gateway whose
+ * validator is stricter than OpenAI's.
+ *
+ * Two separate defects were found by probing AgentRouter's DeepSeek backend
+ * (see docs/agentrouter.md):
+ *
+ *  1. `strict` — OpenAI's structured-outputs flag. The backend rejects a tool
+ *     that carries it at all, for `null`, `false` *and* `true`, with a
+ *     misleading `null is not of type "array"`. It must be absent.
+ *  2. `parameters.required` — when the key is absent the backend deserialises
+ *     it as `null` and rejects it with the *same* message. Supplying `[]`
+ *     turns a ~1-in-6 success rate into a deterministic one, which is how the
+ *     flakiness was traced to this: several backend replicas answer, and they
+ *     do not agree.
+ *
+ * `required: []` means "no property is required", which is exactly what an
+ * absent `required` already meant — the rewrite is a no-op semantically.
+ *
+ * Returns the original body when there is nothing to do, so an untouched
+ * request is never re-serialised.
+ *
+ * @param body - a request body, in whatever shape fetch accepted it.
+ * @returns the same body, or a rewritten one.
+ */
+export function normalizeToolSchemas(body) {
+  if (typeof body !== 'string') return body
+
+  let payload
+  try {
+    payload = JSON.parse(body)
+  } catch {
+    // Not JSON we understand; leave it alone.
+    return body
+  }
+  if (payload === null || typeof payload !== 'object') return body
+
+  const tools = Array.isArray(payload.tools) ? payload.tools : null
+  if (tools === null) return body
+
+  let changed = false
+  for (const tool of tools) {
+    if (tool === null || typeof tool !== 'object') continue
+
+    // (1) Drop `strict`. The wire shape nests under `function`; the ACP proxy
+    // also emits a flattened one, so check both.
+    for (const holder of [tool, tool.function]) {
+      if (holder !== null && typeof holder === 'object' && 'strict' in holder) {
+        delete holder.strict
+        changed = true
+      }
+    }
+
+    // (2) Make `required` an array. Only when a parameters object is already
+    // there — never invent one.
+    const params = tool.function?.parameters ?? tool.parameters
+    if (params !== null && typeof params === 'object' && !Array.isArray(params.required)) {
+      params.required = []
+      changed = true
+    }
+  }
+
+  return changed ? JSON.stringify(payload) : body
+}
+
+/**
  * Build a patched fetch that presents the configured client identity.
  *
  * The route scope is authoritative: a request driven inside an `llm/stream`
@@ -179,8 +248,9 @@ export function withStore(iterable, als) {
  * @param als - the store whose presence marks a route-scoped request.
  * @param userAgent - the identity to present.
  * @param hosts - hosts treated as belonging to the configured routes.
+ * @param normalizeTools - also normalise tool schemas (see `normalizeToolSchemas`).
  */
-export function patchFetch(original, als, userAgent, hosts = new Set(DEFAULT_HOSTS)) {
+export function patchFetch(original, als, userAgent, hosts = new Set(DEFAULT_HOSTS), normalizeTools = false) {
   return function patchedFetch(input, init) {
     const url = requestUrl(input)
     const targeted = als.getStore() !== undefined
@@ -197,14 +267,27 @@ export function patchFetch(original, als, userAgent, hosts = new Set(DEFAULT_HOS
       // An unreadable header bag is not ours to repair; send it as-is.
       return original.apply(this, arguments)
     }
-    if (headers.get('user-agent') === userAgent) return original.apply(this, arguments)
+
+    const alreadyIdentified = headers.get('user-agent') === userAgent
+    let body = init?.body
+    let rewritten = false
+
+    if (normalizeTools) {
+      const normalized = normalizeToolSchemas(body)
+      if (normalized !== body) {
+        body = normalized
+        rewritten = true
+      }
+    }
+
+    if (alreadyIdentified && !rewritten) return original.apply(this, arguments)
     headers.set('user-agent', userAgent)
-    return original.call(this, input, { ...init, headers })
+    return original.call(this, input, { ...init, headers, body })
   }
 }
 
 export function apply(ctx, config) {
-  const { providers, hosts, userAgent } = resolveConfig(config)
+  const { providers, hosts, userAgent, normalizeTools } = resolveConfig(config)
   const als = new AsyncLocalStorage()
 
   const originalFetch = globalThis.fetch
@@ -213,15 +296,16 @@ export function apply(ctx, config) {
     return
   }
 
-  const patched = patchFetch(originalFetch, als, userAgent, hosts)
+  const patched = patchFetch(originalFetch, als, userAgent, hosts, normalizeTools)
 
   ctx.effect(() => {
     globalThis.fetch = patched
     ctx.logger.info(
-      '[provider-client-identity] sending "%s" for providers [%s] on hosts [%s]',
+      '[provider-client-identity] sending "%s" for providers [%s] on hosts [%s]%s',
       userAgent,
       [...providers].join(', '),
       [...hosts].join(', '),
+      normalizeTools ? '; normalising tool schemas' : '',
     )
     return () => {
       if (globalThis.fetch === patched) globalThis.fetch = originalFetch

@@ -1,7 +1,7 @@
 // Focused tests for the client-identity patch. No network, no Harness needed.
 import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { AGENTROUTER_PRESET, apply, inject, name, patchFetch, resolveConfig } from './index.js'
+import { AGENTROUTER_PRESET, apply, inject, name, normalizeToolSchemas, patchFetch, resolveConfig } from './index.js'
 
 const UA = AGENTROUTER_PRESET.userAgent
 let passed = 0
@@ -166,6 +166,96 @@ check('a non-list value falls back rather than throwing', () => {
   const resolved = resolveConfig({ providers: 'agentrouter', hosts: 42 })
   assert.ok(resolved.providers.has('agentrouter'))
   assert.ok(resolved.hosts.has('agentrouter.org'))
+})
+
+// --- tool schema normalisation -------------------------------------------
+
+const nestedTool = (extra = {}) => ({
+  type: 'function',
+  function: {
+    name: 'acp_cache',
+    description: 'Prompt-cache reconciliation.',
+    parameters: { type: 'object', properties: { detail: { type: 'string' } } },
+  },
+  ...extra,
+})
+
+check('normalizeToolSchemas drops `strict` on the tool entry', () => {
+  const body = JSON.stringify({ tools: [nestedTool({ strict: null })] })
+  const out = JSON.parse(normalizeToolSchemas(body))
+  assert.ok(!('strict' in out.tools[0]), 'tool-level strict removed')
+  assert.ok(!('strict' in out.tools[0].function), 'function untouched')
+})
+
+check('normalizeToolSchemas drops `strict` inside `function` too', () => {
+  const tool = nestedTool()
+  tool.function.strict = true
+  const out = JSON.parse(normalizeToolSchemas(JSON.stringify({ tools: [tool] })))
+  assert.ok(!('strict' in out.tools[0].function), 'function-level strict removed')
+})
+
+check('normalizeToolSchemas makes `required` an array', () => {
+  const body = JSON.stringify({ tools: [nestedTool()] })
+  const out = JSON.parse(normalizeToolSchemas(body))
+  assert.deepEqual(out.tools[0].function.parameters.required, [], 'required supplied as []')
+})
+
+check('normalizeToolSchemas handles the proxy\'s flattened shape', () => {
+  const flat = {
+    name: 'acp_cache',
+    description: 'Prompt-cache reconciliation.',
+    parameters: { type: 'object', properties: {} },
+    strict: null,
+    type: 'function',
+  }
+  const out = JSON.parse(normalizeToolSchemas(JSON.stringify({ tools: [flat] })))
+  assert.ok(!('strict' in out.tools[0]), 'flat strict removed')
+  assert.deepEqual(out.tools[0].parameters.required, [], 'flat required supplied')
+})
+
+check('normalizeToolSchemas leaves a compliant body byte-identical', () => {
+  const tool = nestedTool()
+  tool.function.parameters.required = []
+  const body = JSON.stringify({ tools: [tool], model: 'deepseek-v4-flash' })
+  assert.equal(normalizeToolSchemas(body), body, 'nothing to do -> same string')
+})
+
+check('normalizeToolSchemas passes through non-JSON and tool-less bodies', () => {
+  assert.equal(normalizeToolSchemas('not json'), 'not json')
+  assert.equal(normalizeToolSchemas(undefined), undefined)
+  assert.equal(normalizeToolSchemas(JSON.stringify({ model: 'x' })), JSON.stringify({ model: 'x' }))
+})
+
+check('normalizeToolSchemas never invents a parameters object', () => {
+  const tool = { type: 'function', function: { name: 't', description: 'd' } }
+  const out = JSON.parse(normalizeToolSchemas(JSON.stringify({ tools: [tool] })))
+  assert.ok(!('parameters' in out.tools[0].function), 'no parameters invented')
+})
+
+check('the fetch patch normalises only targeted requests', () => {
+  const original = (input, init) => {
+    calls.push({ input, init, headers: new Headers(init?.headers) })
+    return Promise.resolve({ ok: true })
+  }
+  const calls = []
+  const als = new AsyncLocalStorage()
+  const body = JSON.stringify({ tools: [nestedTool({ strict: null })] })
+
+  globalThis.fetch = patchFetch(original, als, UA, new Set(['agentrouter.org']), true)
+  globalThis.fetch('https://agentrouter.org/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  })
+  const rewritten = JSON.parse(calls[0].init.body)
+  assert.ok(!('strict' in rewritten.tools[0]), 'targeted request normalised')
+  assert.deepEqual(rewritten.tools[0].function.parameters.required, [])
+
+  calls.length = 0
+  globalThis.fetch('https://example.com/v1/chat/completions', { method: 'POST', body })
+  assert.equal(calls[0].init.body, body, 'untargeted request untouched')
+
+  globalThis.fetch = original
 })
 
 console.log(`\n${passed} checks passed`)
