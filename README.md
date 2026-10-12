@@ -142,6 +142,7 @@ silently reinstating the preset. To turn the plugin off entirely, set `disabled:
 | `providers` | Provider route keys (the `llm-pi-ai.providers` dict keys) the rewrite applies to. This is the authoritative scope. |
 | `hosts` | Extra scope for calls that never pass through `llm/stream` — model discovery (`GET /v1/models`) above all. **Setting it replaces the defaults**, so list every host you need. |
 | `userAgent` | The `User-Agent` to present. |
+| `normalizeTools` | Also rewrite tool schemas in the outgoing JSON body: drop `strict`, and supply `required: []` when `parameters` is present. Needed by backends that validate function schemas more strictly than OpenAI (AgentRouter's DeepSeek backend). Defaults to the preset's value. |
 
 ### Using it for another gateway
 
@@ -209,6 +210,7 @@ work against any gateway.
 | Config "lost" after moving to the desktop app | The desktop app runs a **separate profile** (`~/.dsh/profiles/desktop`) from the web/CLI one (`~/.dsh/profiles/web`); `dsh --profile desktop --dump-config` is refused with *"managed exclusively by the Electron application"* | Re-apply the provider config and the plugin row under `profiles/desktop/cordis.patch.yml`, then restart the app |
 | Still failing right after changing `baseURL` | Following an earlier revision of this plugin, whose host check overrode the route scope | Upgrade; the route scope is authoritative now (`test.mjs` pins it) |
 | `400 unknown variant 'developer'` | Missing `compat.supportsDeveloperRole: false` | See above |
+| `400 Invalid schema for function '...': null is not of type "array"` | The backend's tool validator rejects OpenAI's `strict` key (as `null`, `false` *or* `true`) **and** an absent `parameters.required`, which it deserialises to `null`. Several backend replicas answer and disagree, so the same request succeeds only some of the time | Set `normalizeTools: true` on the route's row — the AgentRouter preset already does |
 | `400 reasoning_content ... must be passed back` | Thinking-mode replay of an assistant turn that has no reasoning (typically history produced by a *different* provider) | Start a fresh session |
 | Plugin seems inert | Plugin modules are cached; a patch reload does not re-import them | Restart the Harness |
 

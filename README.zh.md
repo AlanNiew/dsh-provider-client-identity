@@ -132,6 +132,7 @@ fiber 作用域的 `ctx.effect`。开发与验证基于 `0.1.5-rc.2`。插件本
 | `providers` | 作用到的 provider 路由 key（即 `llm-pi-ai.providers` 字典的键）。**这是主要判定依据。** |
 | `hosts` | 给不走 `llm/stream` 的调用兜底，主要是设置页的模型发现（`GET /v1/models`）。**配置它会替换默认值**，需要的域名要全部列出。 |
 | `userAgent` | 要呈现的 `User-Agent`。 |
+| `normalizeTools` | 同时改写请求体里的工具 schema：删掉 `strict`，并在 `parameters` 存在时补 `required: []`。给那些对函数 schema 校验比 OpenAI 更严的后端用（AgentRouter 的 DeepSeek 后端即是）。省略时取预设值。 |
 
 ### 用在别的网关上
 
@@ -195,6 +196,7 @@ node tools/e2e.mjs <key>                              # 走真实 OpenAI 客户�
 | 切到桌面端后「配置丢失」 | 桌面端跑的是**另一个 profile**（`~/.dsh/profiles/desktop`），与网页/CLI 用的 `profiles/web` 相互独立；且 `dsh --profile desktop --dump-config` 会被拒：*"managed exclusively by the Electron application"* | 在 `profiles/desktop/cordis.patch.yml` 里重新应用 provider 配置与插件那一行，然后重启应用 |
 | 改了 `baseURL` 后立刻失效 | 用的是本插件早期版本，其域名检查覆盖了路由作用域 | 升级；现在路由作用域是主要依据（`test.mjs` 已锁死） |
 | `400 unknown variant 'developer'` | 缺 `compat.supportsDeveloperRole: false` | 见上 |
+| `400 Invalid schema for function '...': null is not of type "array"` | 后端工具校验器既拒绝 OpenAI 的 `strict` 键（`null`/`false`/`true` 全拒），也拒绝缺失的 `parameters.required`（被反序列化成 `null`）。网关后端有多个副本且校验不一致，所以同一请求时好时坏 | 在该路由的行上设 `normalizeTools: true` —— AgentRouter 预设已默认开启 |
 | `400 reasoning_content ... must be passed back` | 思考模式下回放了没有 reasoning 的 assistant 轮次（典型是历史来自**别的** provider） | 开新会话 |
 | 插件看起来没生效 | 插件模块有缓存，patch 热重载不会重新导入 | 重启 Harness |
 
