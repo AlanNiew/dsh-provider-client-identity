@@ -153,7 +153,7 @@ silently reinstating the preset. To turn the plugin off entirely, set `disabled:
 Note that repointing a route's `baseURL` needs **no** change here — the route scope is authoritative,
 so a mirror works automatically. Only `hosts` (and thus model discovery) is domain-specific.
 
-## The AgentRouter preset also needs two config changes
+## The AgentRouter preset also needs two config changes and one patch
 
 The client identity is only the first gate. AgentRouter forwards `deepseek-*` to DeepSeek's native
 backend, which is OpenAI-compatible but narrower. Two `compat` flags are mandatory.
@@ -175,11 +175,10 @@ if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "
 }
 ```
 
-The Harness reports that as `upstream stream ended before a completion event; this turn may be
-incomplete`, code `TRANSPORT`, and retries the turn up to five times. Measured against the desktop
-app, about half of all streams omitted the field, and a single turn burned **32** retries. The
-streams are not truncated — the content arrives complete, only the terminal marker is missing, which
-is why every hand-written probe "passed" while the app kept retrying.
+Left at the default, that throw surfaced 5 times on the older `agentrouter` route. On `agent-router` it
+never surfaced — because the bundled proxy intercepts the same condition first and rewrites it into an
+error of its own. Set the flag either way: it is what lets a stream that carries no marker be read at
+all, and it is mandatory for the proxy patch below.
 
 Fix both in the provider profile:
 
@@ -203,6 +202,72 @@ gateway that ignores it.
 Full profile, plus every other request-shape finding, is in
 [docs/agentrouter.md](./docs/agentrouter.md).
 
+## Retry storms: the bundled proxy rewrites a truncated stream into an error
+
+This one does not fail, it is slow: the turn completes on a later attempt, so the symptom is a model
+that works but feels sluggish. Reproduce the numbers with
+`node tools/retry-report.mjs --split <iso>`. Over one desktop session, `agent-router` discarded and
+re-generated
+
+| era | retries / attempts | rate |
+| --- | --- | --- |
+| before the two `compat` changes | 92 / 205 | 44.9% |
+| after them, proxy still unpatched | 19 / 87 | 21.8% |
+
+Treat the ratio as noisy — it moves with how busy the gateway is — and the failure-message census as
+the evidence: it names the layer that raised the error. Either way the retries do not stop, because the
+error is not pi-ai's. Census of every `TRANSPORT` `failure.message` in that session:
+
+| message | count | route |
+| --- | --- | --- |
+| `Connection error.` | 153 | almost all `opencode-go` |
+| `upstream stream ended before a completion event; this turn may be incomplete` | 109 | all `agent-router` |
+| `Stream ended without finish_reason` | 17 | `agentrouter` 5, `opencode-go` 10, `open-go-new` 2 — **`agent-router` 0** |
+| `terminated` | 2 | `opencode-go` |
+
+The `agent-router` row is not pi-ai's string. It comes from `billion-context`, the proxy the desktop app
+ships as an ordinary dependency (`~/.dsh/profiles/<profile>/node_modules/billion-context`), which fronts
+every upstream stream. When a stream ends with neither a `finish_reason` **nor** a terminal marker, its
+`emitUpstreamTruncation()` answers it:
+
+```js
+const truncated = !sawTerminal && !res.destroyed && !res.writableEnded;
+if (truncated) {
+    emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log2,
+                           buildTruncationDiag("eof"), transparentTruncationApplies(session));
+    return;
+}
+```
+
+Not transparent, and no `finish_reason` seen, it emits an in-band error chunk
+(`code: "upstream_stream_truncated"`). pi-ai surfaces that message, the Harness classifies it
+`TRANSPORT` and retries the whole turn — up to five attempts, 500 ms → 10 s backoff, 10% jitter. The
+streams are not truncated: the content arrives complete, only the terminal marker is missing, which is
+why every hand-written probe "passed" while the app kept retrying.
+
+The proxy already implements the alternative — hand the raw bytes to the host and let it own truncation
+handling — but the lane allow-list is hard-coded to the `pi` client:
+
+```js
+var TRANSPARENT_TRUNCATION_AGENTS = new Set(["pi"]);
+```
+
+The lane comes from the `x-bili-plugin` request header, and the Harness sets `x-bili-plugin: dsh`, so it
+never qualifies:
+
+```bash
+node tools/enable-transparent-truncation.mjs     # allow-list becomes ["pi","dsh"]
+```
+
+That works only together with `supportsFinishReason: false` above: the stream now arrives unterminated,
+so pi-ai has to derive the stop reason itself instead of throwing on it.
+
+Trade-off, stated plainly: a response the gateway really did cut short is now accepted as complete
+rather than re-run. Re-running it is what costs the third of the session. `billion-context` is an
+ordinary dependency, so reinstalling or upgrading it restores the unpatched file — re-run the script
+afterwards. It lives in the profile's own `node_modules`, outside the app bundle, so it is a plain
+writable file rather than something packed away.
+
 ## How it works
 
 | Step | Detail |
@@ -220,6 +285,8 @@ node tools/client-identity-matrix.mjs <key>           # which identity does the 
 node tools/payload-probe.mjs <key>                    # which request shapes does it accept?
 node tools/gateway-audit.mjs <key>                    # models, caps, modalities, moderation, context
 node tools/e2e.mjs <key>                              # end-to-end through the real OpenAI client
+node tools/enable-transparent-truncation.mjs          # [--revert] the proxy's truncation handling
+node tools/retry-report.mjs                           # how much work is discarded and re-run
 ```
 
 The key is read from `AGENTROUTER_API_KEY` or `argv`. Every tool takes an optional base URL, so they
@@ -236,7 +303,8 @@ work against any gateway.
 | Still failing right after changing `baseURL` | Following an earlier revision of this plugin, whose host check overrode the route scope | Upgrade; the route scope is authoritative now (`test.mjs` pins it) |
 | `400 unknown variant 'developer'` | Missing `compat.supportsDeveloperRole: false` | See above |
 | `400 Invalid schema for function '...': null is not of type "array"` | The backend's tool validator rejects OpenAI's `strict` key (as `null`, `false` *or* `true`) **and** an absent `parameters.required`, which it deserialises to `null`. Several backend replicas answer and disagree, so the same request succeeds only some of the time | Set `normalizeTools: true` on the route's row — the AgentRouter preset already does |
-| `TRANSPORT` over and over, "upstream stream ended before a completion event" | Missing `compat.supportsFinishReason: false`. The gateway drops `finish_reason` on roughly half of its streams; pi-ai throws whenever a stream ends without it, and the Harness retries the whole turn each time | Add the flag — see above. Direct probes do **not** reproduce it: they read the content, which is intact |
+| `TRANSPORT` over and over, "upstream stream ended before a completion event" | Not pi-ai. The bundled `billion-context` proxy turns a stream that ended without a terminal marker into an in-band error, and the Harness retries the whole turn. The gateway also omits `finish_reason` on a large fraction of streams | `node tools/enable-transparent-truncation.mjs` **and** `compat.supportsFinishReason: false` — both, or the retry comes straight back. Direct probes do **not** reproduce it: they read the content, which is intact |
+| The proxy patch stops applying after a dependency upgrade | `billion-context` is an ordinary npm dependency; reinstalling or upgrading it restores the unpatched `dist/index.js` | Re-run `tools/enable-transparent-truncation.mjs`; it is idempotent and reports what it found |
 | A config key appears to have no effect | The loader reads config by key and drops anything outside its parent silently — e.g. `normalizeTools` written at the loader-row level instead of under `config:` | Check the nesting; `npm test` pins the shipped bundle's layout |
 | `400 reasoning_content ... must be passed back` | Thinking-mode replay of an assistant turn that has no reasoning (typically history produced by a *different* provider) | Start a fresh session |
 | Plugin seems inert | Plugin modules are cached; a patch reload does not re-import them | Restart the Harness |

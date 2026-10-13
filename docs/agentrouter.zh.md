@@ -252,8 +252,9 @@ DNS 污染        → 连接超时（agentrouter.org 在国内）
 
 排查时按这个顺序自下而上定位，不要跳步。
 
-第 4 个根因（流缺 `finish_reason`，见 5.3）**不属于这一族**：它没有任何一层被拒，响应被完整收下，
-故障出在客户端对终止标记的要求上。它的症状也不同 —— 不是报错文案，而是重试风暴。
+第 4 个根因（见 5.3）**不属于这一族**：它没有任何一层被拒，响应被完整收下，故障出在「没有终止
+标记就结束的流被随包代理改写成了错误」上。它的症状也不同 —— 不是报错文案，而是重试风暴，而且
+它的修复不是单个开关，需要透传补丁与 `compat` 两半一起上。
 
 ---
 
@@ -316,12 +317,75 @@ llm-pi-ai:
       transport: auto
 ```
 
-### 5.3 还要关掉 `supportsFinishReason`
+### 5.3 第 4 个根因：根本不是认证错误，而是重试风暴
 
-这一条跟前三条不同：它**从不**报「API 密钥无效」，而是表现为重试风暴。
+它跟前三条不同：**从不**报「API 密钥无效」，而且也不算失败 —— 回合在后续某次尝试里完成了，
+用户看到的是一个能用但感觉迟缓的模型。用 `node tools/retry-report.mjs --split <iso>` 可以复现
+下面的数字。桌面端单次会话实测，`agent-router` 丢弃并重新生成了
 
-网关相当大比例的流式响应不带 `finish_reason`，而 pi-ai 拒绝任何没有它的流。摘自随包的
-pi-ai，`openai-completions.js`：
+| 时期 | 重试 / 尝试 | 比例 |
+| --- | --- | --- |
+| 两处 `compat` 改动之前 | 92 / 205 | 44.9% |
+| 之后（代理仍未打补丁） | 19 / 87 | 21.8% |
+
+把比例当作有噪声的指标 —— 它随网关繁忙程度浮动 —— 而把失败消息普查当作证据：它指明是哪一层
+抛的错。无论哪种口径，重试都没有停下来，因为这个错误不是 pi-ai 的。该会话里所有 `TRANSPORT`
+`failure.message` 的普查 —— 这个字段始终只有 `{message, code}`，没有 `diag`：
+
+| message | 次数 | 路由 |
+| --- | --- | --- |
+| `Connection error.` | 153 | 几乎全是 `opencode-go` |
+| `upstream stream ended before a completion event; this turn may be incomplete` | 109 | 全部是 `agent-router` |
+| `Stream ended without finish_reason` | 17 | `agentrouter` 5、`opencode-go` 10、`open-go-new` 2 —— **`agent-router` 0** |
+| `terminated` | 2 | `opencode-go` |
+
+`agent-router` 那一行不是 pi-ai 的字符串。它来自 `billion-context` —— 桌面端作为普通依赖随包
+携带的代理（`~/.dsh/profiles/<profile>/node_modules/billion-context`），它拦在所有上游流前面。
+当一条流既没有 `finish_reason` **也没有**终止标记就结束时，由它的 `emitUpstreamTruncation()`
+来应答：
+
+```js
+const truncated = !sawTerminal && !res.destroyed && !res.writableEnded;
+if (truncated) {
+    emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log2,
+                           buildTruncationDiag("eof"), transparentTruncationApplies(session));
+    return;
+}
+```
+
+在非透传、且没见过 `finish_reason` 时，它发一个带内错误块（`code: "upstream_stream_truncated"`）；
+如果这条 OpenAI 兼容路由上见过 `finish_reason`，它只关闭流。pi-ai 把消息抛出来，Harness 按
+`["normal", 5, ["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"], 500, 10000, 0.1]`
+重试整个回合 —— 最多 5 次，退避 500 ms → 10 s，10% 抖动。
+
+修复前在桌面端实测：**单个回合 32 次重试**，全是 `TRANSPORT`，均匀铺满 20 分钟（不是坏时间窗），
+而且其中没有一次 401、400 或 429。最后这点是关键线索：认证和请求体形状都已经干净了，剩下的故障
+只能出在「如何读一个正常的响应」上。
+
+**为什么所有手写探测都没发现**：探测只读内容，而内容是完整的。只有要求终止标记的客户端才会看到
+问题。这些流并没有被截断。
+
+代理其实已经实现了另一条路 —— 把原始字节交给宿主，由宿主自行处理截断 —— 但通道白名单是硬编码的：
+
+```js
+var TRANSPARENT_TRUNCATION_AGENTS = new Set(["pi"]);
+function transparentTruncationApplies(session) {
+    const agent = session?.metadata?.pluginAgent;
+    return typeof agent === "string" && TRANSPARENT_TRUNCATION_AGENTS.has(agent);
+}
+```
+
+通道来自请求头 `x-bili-plugin`，而 Harness 发的是 `x-bili-plugin: dsh`，所以永远不在白名单里，
+永远走错误那条路。
+
+修复的两半缺一不可：
+
+```bash
+node tools/enable-transparent-truncation.mjs     # 白名单变成 ["pi","dsh"]
+```
+
+再加上 provider 行上的 `supportsFinishReason: false`。原始流透传进来之后，pi-ai 需要这个开关
+自己推导终止原因，而不是抛错：
 
 ```js
 if (!hasFinishReason && !compat.supportsFinishReason) {
@@ -333,24 +397,9 @@ if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "
 }
 ```
 
-`supportsFinishReason` 默认是 `true`，于是走的是抛错那条路，Harness 报：
-
-```
-upstream stream ended before a completion event; this turn may be incomplete   (code: TRANSPORT)
-```
-
-并按 `["normal", 5, ["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"], 500, 10000, 0.1]`
-重试整个回合 —— 最多 5 次，退避 500 ms → 10 s，10% 抖动。
-
-修复前在桌面端实测：**单个回合 32 次重试**，全是 `TRANSPORT`，均匀铺满 20 分钟（不是坏时间窗），
-而且其中没有一次 401、400 或 429。最后这点是关键线索：认证和请求体形状都已经干净了，剩下的故障
-只能出在「如何读一个正常的响应」上。
-
-**为什么所有手写探测都没发现**：探测只读内容，而内容是完整的。只有要求终止标记的客户端 —— 也就
-是 pi-ai —— 才会看到问题。流并没有被截断。
-
-修复就是设 `supportsFinishReason: false`，pi-ai 于是自己推导终止原因（即上面那段分支），这正是
-跳过该标记的网关的本意。
+代价说清楚：网关确实截断了的响应，现在会被当作完整收下，而不是重跑一遍。而这三分之一会话的开销，
+正是重跑带来的。`billion-context` 是普通依赖，所以重装或升级它会还原成未打补丁的文件 —— 之后
+重新跑那个脚本。
 
 ---
 
@@ -363,7 +412,8 @@ upstream stream ended before a completion event; this turn may be incomplete   (
 | 提示「API 密钥无效」 | 解压会话日志搜 `401\|403` | 看到 `unauthorized client detected` → 是 UA/指纹问题，不是密钥 |
 | 同上，且刚换了镜像 | `node tools/client-identity-matrix.mjs <key>` | 新域名是不是同一个网关；`claude-cli` UA 是否为 200 |
 | `400 unknown variant 'developer'` | 检查 `settings.yaml` | `compat.supportsDeveloperRole` 是否为 `false` |
-| 反复 `TRANSPORT` 重试，日志里 `upstream stream ended before a completion event` | 解压会话日志数 `llm/retry` 记录 | 缺 `compat.supportsFinishReason: false`。直连探测**测不出来**（内容本身完整），只能看流里 `finish_reason` 是否缺失 —— 见 5.3 |
+| 反复 `TRANSPORT` 重试，日志里 `upstream stream ended before a completion event` | `node tools/retry-report.mjs --split <iso>` | 不是 pi-ai。随包的 `billion-context` 代理把「没有终止标记就结束」的流改写成带内错误，Harness 于是整回合重试。看失败消息普查里是哪一层抛的错 —— 见 5.3。要两半一起修：透传补丁 **和** `compat.supportsFinishReason: false` |
+| 依赖升级后代理补丁不再生效 | — | `billion-context` 是普通 npm 依赖；重装或升级会还原成未打补丁的 `dist/index.js`，重跑 `node tools/enable-transparent-truncation.mjs`（幂等，会报告自己发现了什么） |
 | `400 reasoning_content ... must be passed back` | — | 历史来自别的 provider，开新会话 |
 | `402 Budget pool quota` | `node gateway-audit.mjs <key>` | 该模型额度池耗尽，换 `deepseek-v4-flash` |
 | `400 content-blocked` | — | 高度重复的内容触发审核，换成正常文本 |
@@ -380,6 +430,8 @@ node tools/client-identity-matrix.mjs <key>   # 各域名的 UA 对照矩阵
 node tools/gateway-audit.mjs <key>            # 模型可用性 / 上限 / 模态 / 审核 / 长上下文
 node tools/payload-probe.mjs <key>            # 请求体各字段接受度
 node tools/e2e.mjs <key> [baseURL]            # 走真实 openai SDK 的端到端
+node tools/enable-transparent-truncation.mjs  # [--revert] 代理的截断处理逻辑
+node tools/retry-report.mjs                   # 有多少工作被丢弃并重跑（--split <iso> 做前后对比）
 ```
 
 密钥可用 `AGENTROUTER_API_KEY` 环境变量传入，避免留在命令历史里。

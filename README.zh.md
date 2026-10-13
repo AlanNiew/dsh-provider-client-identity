@@ -142,7 +142,7 @@ fiber 作用域的 `ctx.effect`。开发与验证基于 `0.1.5-rc.2`。插件本
 注意：**换路由的 `baseURL` 不需要改这里** —— 路由作用域是主要依据，所以换镜像自动生效。
 只有 `hosts`（也就是模型发现）跟域名相关。
 
-## AgentRouter 预设还需要改两处配置
+## AgentRouter 预设还需要改两处配置和一个补丁
 
 客户端身份只是第一道门。AgentRouter 把 `deepseek-*` 转发到 DeepSeek 原生后端，它虽然 OpenAI
 兼容但更窄。有两个 `compat` 开关是硬性的。
@@ -163,10 +163,9 @@ if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "
 }
 ```
 
-Harness 把它报成 `upstream stream ended before a completion event; this turn may be incomplete`，
-归类 `TRANSPORT`，并把整个回合重试最多 5 次。桌面端实测：约一半的流缺这个字段，单个回合烧掉
-**32** 次重试。流本身没有被截断 —— 内容完整，只是缺终止标记。这也解释了为什么手写探测全都
-「通过」，而应用一直在重试。
+保持默认值时，这个抛错在较早的 `agentrouter` 路由上出现过 5 次。在 `agent-router` 上它从未
+出现 —— 因为随包代理先一步拦下了同样的条件，把它改写成了自己的错误。无论如何都要设这个开关：
+它让不带标记的流至少能被读取，下面的代理补丁也必须依赖它。
 
 两处都在 provider 配置里修：
 
@@ -188,6 +187,68 @@ llm-pi-ai:
 
 完整配置、以及其余请求体字段的实测结论，见 [docs/agentrouter.zh.md](./docs/agentrouter.zh.md)。
 
+## 重试风暴：随包代理把被截断的流改写成错误
+
+这一条不会失败，只会变慢：回合在后续某次尝试里完成了，所以症状是模型能用但感觉迟缓。
+用 `node tools/retry-report.mjs --split <iso>` 可以复现下面的数字。桌面端单次会话实测，
+`agent-router` 丢弃并重新生成了
+
+| 时期 | 重试 / 尝试 | 比例 |
+| --- | --- | --- |
+| 两处 `compat` 改动之前 | 92 / 205 | 44.9% |
+| 之后（代理仍未打补丁） | 19 / 87 | 21.8% |
+
+把比例当作有噪声的指标 —— 它随网关繁忙程度浮动 —— 而把失败消息普查当作证据：它指明是哪一层
+抛的错。无论哪种口径，重试都没有停下来，因为这个错误不是 pi-ai 的。该会话里所有 `TRANSPORT`
+`failure.message` 的普查：
+
+| message | 次数 | 路由 |
+| --- | --- | --- |
+| `Connection error.` | 153 | 几乎全是 `opencode-go` |
+| `upstream stream ended before a completion event; this turn may be incomplete` | 109 | 全部是 `agent-router` |
+| `Stream ended without finish_reason` | 17 | `agentrouter` 5、`opencode-go` 10、`open-go-new` 2 —— **`agent-router` 0** |
+| `terminated` | 2 | `opencode-go` |
+
+`agent-router` 那一行不是 pi-ai 的字符串。它来自 `billion-context` —— 桌面端作为普通依赖随包
+携带的代理（`~/.dsh/profiles/<profile>/node_modules/billion-context`），它拦在所有上游流前面。
+当一条流既没有 `finish_reason` **也没有**终止标记就结束时，由它的 `emitUpstreamTruncation()`
+来应答：
+
+```js
+const truncated = !sawTerminal && !res.destroyed && !res.writableEnded;
+if (truncated) {
+    emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log2,
+                           buildTruncationDiag("eof"), transparentTruncationApplies(session));
+    return;
+}
+```
+
+在非透传、且没见过 `finish_reason` 时，它发一个带内错误块（`code: "upstream_stream_truncated"`）。
+pi-ai 把这个消息抛出来，Harness 归类为 `TRANSPORT`，并重试整个回合 —— 最多 5 次，
+退避 500 ms → 10 s，10% 抖动。这些流并没有被截断：内容完整送达，只是缺终止标记，这正是为什么
+每个手写探测都「通过」，而应用一直在重试。
+
+代理其实已经实现了另一条路 —— 把原始字节交给宿主，由宿主自行处理截断 —— 但通道白名单被硬编码
+成只认 `pi` 客户端：
+
+```js
+var TRANSPARENT_TRUNCATION_AGENTS = new Set(["pi"]);
+```
+
+通道来自请求头 `x-bili-plugin`，而 Harness 发的是 `x-bili-plugin: dsh`，所以永远不在白名单里：
+
+```bash
+node tools/enable-transparent-truncation.mjs     # 白名单变成 ["pi","dsh"]
+```
+
+它必须和上面的 `supportsFinishReason: false` 一起用：现在流是以「没有终止」的状态送进来的，
+pi-ai 得自己推导终止原因，而不是对着它抛错。
+
+代价说清楚：网关确实截断了的响应，现在会被当作完整收下，而不是重跑一遍。而这三分之一会话的开销，
+正是重跑带来的。`billion-context` 是普通依赖，所以重装或升级它会还原成未打补丁的文件 —— 之后
+重新跑那个脚本。它位于 profile 自己的 `node_modules` 里，在应用 bundle 之外，因此是一个普通可写
+文件，而不是被包死的东西。
+
 ## 工作原理
 
 | 步骤 | 说明 |
@@ -205,6 +266,8 @@ node tools/client-identity-matrix.mjs <key>           # 网关要哪个身份？
 node tools/payload-probe.mjs <key>                    # 它接受哪些请求体形状？
 node tools/gateway-audit.mjs <key>                    # 模型 / 上限 / 模态 / 审核 / 上下文
 node tools/e2e.mjs <key>                              # 走真实 OpenAI 客户端的端到端
+node tools/enable-transparent-truncation.mjs          # [--revert] 代理的截断处理逻辑
+node tools/retry-report.mjs                           # 有多少工作被丢弃并重跑
 ```
 
 密钥从 `AGENTROUTER_API_KEY` 环境变量或 `argv` 读取。每个工具都接受可选的 base URL，可对任意网关使用。
@@ -221,7 +284,8 @@ node tools/e2e.mjs <key>                              # 走真实 OpenAI 客户�
 | `400 unknown variant 'developer'` | 缺 `compat.supportsDeveloperRole: false` | 见上 |
 | `400 Invalid schema for function '...': null is not of type "array"` | 后端工具校验器既拒绝 OpenAI 的 `strict` 键（`null`/`false`/`true` 全拒），也拒绝缺失的 `parameters.required`（被反序列化成 `null`）。网关后端有多个副本且校验不一致，所以同一请求时好时坏 | 在该路由的行上设 `normalizeTools: true` —— AgentRouter 预设已默认开启 |
 | `400 reasoning_content ... must be passed back` | 思考模式下回放了没有 reasoning 的 assistant 轮次（典型是历史来自**别的** provider） | 开新会话 |
-| `TRANSPORT` 反复出现，`upstream stream ended before a completion event` | 缺 `compat.supportsFinishReason: false`。网关约一半的流不带 `finish_reason`，pi-ai 遇到没有它的流就抛错，Harness 于是整回合重试 | 加上该开关 —— 见上。直连探测**复现不出来**：它只读内容，而内容本身是完整的 |
+| `TRANSPORT` 反复出现，`upstream stream ended before a completion event` | 不是 pi-ai。随包的 `billion-context` 代理把「没有终止标记就结束」的流改写成带内错误，Harness 于是整回合重试。网关本身也在相当大比例的流上省略 `finish_reason` | `node tools/enable-transparent-truncation.mjs` **和** `compat.supportsFinishReason: false` —— 两个都要，否则重试立刻回来。直连探测**复现不出来**：它只读内容，而内容本身是完整的 |
+| 依赖升级后代理补丁不再生效 | `billion-context` 是普通 npm 依赖；重装或升级它会还原成未打补丁的 `dist/index.js` | 重新跑 `tools/enable-transparent-truncation.mjs`；它是幂等的，并会报告自己发现了什么 |
 | 某个配置键看起来完全没生效 | 加载器按 key 取配置，位置不对的键会被静默丢弃 —— 例如把 `normalizeTools` 写在加载器行一级，而不是 `config:` 下面 | 检查层级；`npm test` 已锁死随包发布的 bundle 结构 |
 | 插件看起来没生效 | 插件模块有缓存，patch 热重载不会重新导入 | 重启 Harness |
 

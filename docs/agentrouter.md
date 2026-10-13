@@ -71,9 +71,78 @@ DNS poisoned        -> connect timeout (agentrouter.org from mainland China)
 
 ## Failure 4: not an auth error at all — a retry storm
 
-Distinct from the three above, and it never says "API key is invalid". The gateway omits
-`finish_reason` on a large fraction of its streamed responses, and pi-ai refuses any stream that ends
-without it. From the bundled pi-ai, `openai-completions.js`:
+Distinct from the three above, and the only one that never says "API key is invalid". It does not fail
+either: the turn completes on a later attempt, so the user-visible symptom is a model that works but
+feels sluggish. Reproduce the numbers with `node tools/retry-report.mjs --split <iso>`. Over one desktop
+session, `agent-router` discarded and re-generated
+
+| era | retries / attempts | rate |
+| --- | --- | --- |
+| before the two `compat` changes | 92 / 205 | 44.9% |
+| after them, proxy still unpatched | 19 / 87 | 21.8% |
+
+Treat the ratio as noisy — it moves with how busy the gateway is — and the failure-message census as
+the evidence: it names the layer that raised the error. Either way the retries do not stop, because the
+error is not pi-ai's. Census of every `TRANSPORT` `failure.message` in that session — the field stays
+`{message, code}`, there is no `diag`:
+
+| message | count | route |
+| --- | --- | --- |
+| `Connection error.` | 153 | almost all `opencode-go` |
+| `upstream stream ended before a completion event; this turn may be incomplete` | 109 | all `agent-router` |
+| `Stream ended without finish_reason` | 17 | `agentrouter` 5, `opencode-go` 10, `open-go-new` 2 — **`agent-router` 0** |
+| `terminated` | 2 | `opencode-go` |
+
+The `agent-router` row is not pi-ai's string. It comes from `billion-context`, the proxy the desktop app
+ships as an ordinary dependency (`~/.dsh/profiles/<profile>/node_modules/billion-context`), which fronts
+every upstream stream. When a stream ends with neither a `finish_reason` **nor** a terminal marker, its
+`emitUpstreamTruncation()` answers it:
+
+```js
+const truncated = !sawTerminal && !res.destroyed && !res.writableEnded;
+if (truncated) {
+    emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log2,
+                           buildTruncationDiag("eof"), transparentTruncationApplies(session));
+    return;
+}
+```
+
+Not transparent, and no `finish_reason` seen, it emits an in-band error chunk
+(`code: "upstream_stream_truncated"`); with a `finish_reason` seen on an OpenAI-compatible route it only
+closes the stream. pi-ai surfaces that message, and the Harness retries the turn under
+`["normal", 5, ["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"], 500, 10000, 0.1]` —
+five attempts, 500 ms → 10 s backoff, 10% jitter.
+
+Measured before any fix: **32 retries in one turn**, all `TRANSPORT`, spread evenly across 20 minutes —
+not a bad time window — and not one 401, 400 or 429 among them. That last detail is the tell:
+authentication and request-shape were already clean, so the residual failure had to be in how a good
+response is *read*.
+
+Why every hand-written probe missed it: a probe reads the content, which arrives complete. Only a client
+that requires the terminal marker sees a problem. The streams are not truncated.
+
+The proxy already implements the alternative — hand the raw bytes to the host and let it own truncation
+handling — but the lane allow-list is hard-coded:
+
+```js
+var TRANSPARENT_TRUNCATION_AGENTS = new Set(["pi"]);
+function transparentTruncationApplies(session) {
+    const agent = session?.metadata?.pluginAgent;
+    return typeof agent === "string" && TRANSPARENT_TRUNCATION_AGENTS.has(agent);
+}
+```
+
+The lane comes from the `x-bili-plugin` request header, and the Harness sets `x-bili-plugin: dsh`, so it
+never qualifies and always takes the error path.
+
+Both halves of the fix are required:
+
+```bash
+node tools/enable-transparent-truncation.mjs     # allow-list becomes ["pi","dsh"]
+```
+
+plus `supportsFinishReason: false` on the provider row. With the raw stream passed through, pi-ai needs
+that flag to derive the stop reason itself rather than throw:
 
 ```js
 if (!hasFinishReason && !compat.supportsFinishReason) {
@@ -85,26 +154,10 @@ if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "
 }
 ```
 
-`supportsFinishReason` defaults to `true`, so the throw wins and the Harness reports
-
-```
-upstream stream ended before a completion event; this turn may be incomplete   (code: TRANSPORT)
-```
-
-then retries the turn under
-`["normal", 5, ["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"], 500, 10000, 0.1]` —
-five attempts, 500 ms → 10 s backoff, 10% jitter.
-
-Measured on the desktop app before the fix: **32 retries in one turn**, all `TRANSPORT`, spread
-evenly across 20 minutes — not a bad time window — and not one 401, 400 or 429 among them. That last
-detail is the tell: authentication and request-shape were already clean, so the residual failure had
-to be in how a good response is *read*.
-
-Why every hand-written probe missed it: a probe reads the content, which arrives complete. Only a
-client that requires the terminal marker — i.e. pi-ai — sees a problem. The streams are not truncated.
-
-Fix: set `supportsFinishReason: false`. pi-ai then derives the reason itself, taking exactly the
-branch shown above, which is what a gateway that skips the marker intends.
+Trade-off, stated plainly: a response the gateway really did cut short is now accepted as complete
+instead of being re-run. Re-running it is what costs the third of the session. `billion-context` is an
+ordinary dependency, so reinstalling or upgrading it restores the unpatched file — re-run the script
+afterwards.
 
 ---
 
